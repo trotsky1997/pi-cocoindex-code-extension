@@ -28,11 +28,9 @@ The goal is simple: make CocoIndex feel native inside pi without asking the agen
 - [pi](https://github.com/mariozechner/pi-coding-agent)
 - `ccc` installed locally
 
-Install `ccc` with one of the supported methods from `cocoindex-code`, for example:
+For `ccc` installation, follow the official CocoIndex Code install guide:
 
-```bash
-pipx install cocoindex-code
-```
+- `https://github.com/cocoindex-io/cocoindex-code?tab=readme-ov-file#install`
 
 ## Install
 

@@ -2,17 +2,9 @@
 
 ## Installation
 
-Install CocoIndex Code via pipx:
+For installation and upgrade instructions, use the official CocoIndex Code install guide:
 
-```bash
-pipx install cocoindex-code
-```
-
-To upgrade to the latest version:
-
-```bash
-pipx upgrade cocoindex-code
-```
+- `https://github.com/cocoindex-io/cocoindex-code?tab=readme-ov-file#install`
 
 After installation, the `ccc` command is available globally.
 
