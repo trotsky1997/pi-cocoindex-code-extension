@@ -1,10 +1,14 @@
 {
   "name": "pi-cocoindex-code-extension",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Pi package bundling a CocoIndex search extension and the ccc skill.",
+  "license": "MIT",
   "keywords": ["pi-package", "pi", "cocoindex", "ccc", "semantic-search"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/trotsky1997/pi-cocoindex-code-extension.git"
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"

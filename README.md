@@ -1,28 +1,85 @@
 # pi-cocoindex-code-extension
 
-Pi package bundling:
+Pi package that bundles two pieces together:
 
-- a local CocoIndex-powered `search` extension for pi
-- the `ccc` skill for semantic code search lifecycle guidance
+- a `cocoindex-code` powered pi extension that exposes semantic code search as a tool
+- a `ccc` skill that teaches the agent when to initialize, index, refresh, and search
 
-## Install locally
+The goal is simple: make CocoIndex feel native inside pi without asking the agent to manually manage the full `ccc` lifecycle every time.
+
+## What it includes
+
+- `extensions/cocoindex.ts`
+  Registers a `search` tool with parameters aligned to the `cocoindex-code` MCP shape:
+  - `query`
+  - `limit`
+  - `offset`
+  - `refresh_index`
+  - `languages`
+  - `paths`
+
+- `skills/ccc/`
+  Bundles the existing `ccc` skill plus reference docs for:
+  - installation and management
+  - settings and embedding configuration
+
+## Requirements
+
+- [pi](https://github.com/mariozechner/pi-coding-agent)
+- `ccc` installed locally
+
+Install `ccc` with one of the supported methods from `cocoindex-code`, for example:
+
+```bash
+pipx install cocoindex-code
+```
+
+## Install
+
+Install from GitHub:
+
+```bash
+pi install git:github.com/trotsky1997/pi-cocoindex-code-extension
+```
+
+Or install from a local checkout:
 
 ```bash
 pi install ./pi-cocoindex-code-extension
 ```
 
-Or load it for one run:
+## Usage
 
-```bash
-pi -e ./pi-cocoindex-code-extension/extensions/cocoindex.ts
+After installing, reload pi or start a new session.
+
+The package gives you:
+
+- a `search` tool for semantic code search
+- a `/ccc-status` command
+- a footer status indicator showing whether CocoIndex is available and initialized
+- the `ccc` skill for agent-side search workflow guidance
+
+Typical usage inside pi:
+
+```text
+search authentication flow
+search trainer initialization logic
+search error handling retry logic
 ```
 
-## Contents
+The extension will automatically:
 
-- `extensions/cocoindex.ts` — registers the `search` tool, `/ccc-status`, and a footer status indicator
-- `skills/ccc/` — loads the `ccc` skill plus management/settings references
+- locate the project root
+- detect whether `.cocoindex_code/settings.yml` exists
+- run `ccc init` and `ccc index` on first search if needed
+- refresh footer status on new turns
 
 ## Notes
 
-- The extension uses the local `ccc` CLI and auto-runs `ccc init` + `ccc index` on first search when needed.
-- The skill teaches the agent when to use semantic search and how to manage index freshness.
+- The extension currently wraps the local `ccc` CLI rather than embedding `ccc mcp` directly.
+- The `search` tool shape is intentionally kept close to the CocoIndex MCP interface.
+- If you already have a global `ccc` skill installed, pi may prefer the first discovered skill with that name.
+
+## Repository
+
+- GitHub: `https://github.com/trotsky1997/pi-cocoindex-code-extension`
