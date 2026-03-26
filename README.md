@@ -30,6 +30,20 @@ The goal is simple: make CocoIndex feel native inside pi without asking the agen
 
 For `ccc` installation, follow the [official CocoIndex Code install guide](https://github.com/cocoindex-io/cocoindex-code?tab=readme-ov-file#install).
 
+Install
+Using pipx:
+
+```bash
+pipx install cocoindex-code       # first install
+pipx upgrade cocoindex-code       # upgrade
+```
+
+Using uv:
+
+```bash
+uv tool install --upgrade cocoindex-code --prerelease explicit --with "cocoindex>=1.0.0a24"
+```
+
 ## Install
 
 Install from GitHub:
