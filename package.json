@@ -1,0 +1,16 @@
+{
+  "name": "pi-cocoindex-code-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi package bundling a CocoIndex search extension and the ccc skill.",
+  "keywords": ["pi-package", "pi", "cocoindex", "ccc", "semantic-search"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  }
+}
