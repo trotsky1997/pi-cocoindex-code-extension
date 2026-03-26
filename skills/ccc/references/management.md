@@ -2,9 +2,7 @@
 
 ## Installation
 
-For installation and upgrade instructions, use the official CocoIndex Code install guide:
-
-- `https://github.com/cocoindex-io/cocoindex-code?tab=readme-ov-file#install`
+For installation and upgrade instructions, use the [official CocoIndex Code install guide](https://github.com/cocoindex-io/cocoindex-code?tab=readme-ov-file#install).
 
 After installation, the `ccc` command is available globally.
 
