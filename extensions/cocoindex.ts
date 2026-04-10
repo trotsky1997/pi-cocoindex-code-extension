@@ -113,16 +113,38 @@ function parseShebangInterpreter(scriptText: string): string | null {
 	return parts[0] ?? null;
 }
 
+function windowsExecutableExtensions(command: string): string[] {
+	if (process.platform !== "win32" || path.extname(command)) {
+		return [""];
+	}
+	const extensions = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+		.split(";")
+		.map((ext) => ext.trim())
+		.filter(Boolean);
+	return ["", ...extensions];
+}
+
+async function findExecutableCandidate(basePath: string): Promise<string | null> {
+	for (const extension of windowsExecutableExtensions(basePath)) {
+		const candidate = `${basePath}${extension}`;
+		if (await pathExists(candidate)) {
+			return candidate;
+		}
+	}
+	return null;
+}
+
 async function findCommandPath(command: string): Promise<string | null> {
-	if (command.includes(path.sep)) {
-		return (await pathExists(command)) ? command : null;
+	const isPathLike = command.includes(path.sep) || command.includes("/") || command.includes("\\");
+	if (isPathLike) {
+		return findExecutableCandidate(command);
 	}
 
 	const pathValue = process.env.PATH ?? "";
 	for (const dir of pathValue.split(path.delimiter)) {
 		if (!dir) continue;
-		const candidate = path.join(dir, command);
-		if (await pathExists(candidate)) {
+		const candidate = await findExecutableCandidate(path.join(dir, command));
+		if (candidate) {
 			return candidate;
 		}
 	}
@@ -212,29 +234,97 @@ function runCommand(command: string, args: string[], cwd: string, signal?: Abort
 	});
 }
 
+async function validateCccPython(pythonPath: string, projectRoot: string): Promise<string | null> {
+	if (!(await pathExists(pythonPath))) {
+		return null;
+	}
+	const check = await runCommand(pythonPath, ["-c", "import cocoindex_code, sys; print(sys.executable)"], projectRoot);
+	return check.code === 0 ? pythonPath : null;
+}
+
+function pythonExecutablesForToolDir(toolDir: string): string[] {
+	return [
+		path.join(toolDir, "cocoindex-code", "Scripts", "python.exe"),
+		path.join(toolDir, "cocoindex-code", "bin", "python3"),
+		path.join(toolDir, "cocoindex-code", "bin", "python"),
+	];
+}
+
+async function getUvToolDir(projectRoot: string): Promise<string | null> {
+	const uvPath = await findCommandPath("uv");
+	if (!uvPath) {
+		return null;
+	}
+	const result = await runCommand(uvPath, ["tool", "dir"], projectRoot);
+	if (result.code !== 0) {
+		return null;
+	}
+	const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	return lines[lines.length - 1] ?? null;
+}
+
+async function cccPythonCandidates(projectRoot: string, cccPath: string): Promise<string[]> {
+	const candidates: string[] = [];
+	const addToolDir = (toolDir: string | null | undefined) => {
+		if (!toolDir) return;
+		candidates.push(...pythonExecutablesForToolDir(toolDir));
+	};
+
+	addToolDir(await getUvToolDir(projectRoot));
+
+	const cccDir = path.dirname(cccPath);
+	addToolDir(path.resolve(cccDir, "..", "share", "uv", "tools"));
+	addToolDir(path.resolve(cccDir, "..", "tools"));
+
+	const home = process.env.USERPROFILE || process.env.HOME;
+	if (home) {
+		addToolDir(path.join(home, ".local", "share", "uv", "tools"));
+		candidates.push(
+			path.join(home, ".local", "pipx", "venvs", "cocoindex-code", "Scripts", "python.exe"),
+			path.join(home, ".local", "pipx", "venvs", "cocoindex-code", "bin", "python"),
+		);
+	}
+
+	for (const envRoot of [process.env.APPDATA, process.env.LOCALAPPDATA]) {
+		if (!envRoot) continue;
+		addToolDir(path.join(envRoot, "uv", "tools"));
+		candidates.push(path.join(envRoot, "pipx", "venvs", "cocoindex-code", "Scripts", "python.exe"));
+	}
+
+	return [...new Set(candidates)];
+}
+
 async function resolveCccPython(projectRoot: string): Promise<string> {
 	const cccPath = await findCommandPath("ccc");
 	if (!cccPath) {
 		throw new Error("ccc not found on PATH");
 	}
 
-	const launcherText = await readFile(cccPath, "utf8");
-	const pythonHint = parseShebangInterpreter(launcherText);
-	if (!pythonHint) {
-		throw new Error(`Could not parse the ccc launcher at ${cccPath}`);
+	const launcherExt = path.extname(cccPath).toLowerCase();
+	if (!new Set([".exe", ".cmd", ".bat"]).has(launcherExt)) {
+		const launcherText = await readFile(cccPath, "utf8");
+		const pythonHint = parseShebangInterpreter(launcherText);
+		if (pythonHint) {
+			const pythonPath = pythonHint.includes(path.sep) || pythonHint.includes("/") || pythonHint.includes("\\")
+				? pythonHint
+				: await findCommandPath(pythonHint);
+			if (pythonPath) {
+				const valid = await validateCccPython(pythonPath, projectRoot);
+				if (valid) return valid;
+			}
+		}
 	}
 
-	if (pythonHint.includes(path.sep)) {
-		return pythonHint;
+	for (const candidate of await cccPythonCandidates(projectRoot, cccPath)) {
+		const valid = await validateCccPython(candidate, projectRoot);
+		if (valid) return valid;
 	}
 
-	const resolved = await findCommandPath(pythonHint);
-	if (!resolved) {
-		throw new Error(`Could not resolve the ccc Python interpreter (${pythonHint})`);
-	}
-	return resolved;
+	throw new Error(
+		`Could not locate the Python environment behind ${cccPath}. ` +
+			"Try running `uv tool dir` or reinstalling cocoindex-code with uv/pipx.",
+	);
 }
-
 
 async function detectRapidFuzzVersion(pythonPath: string, projectRoot: string): Promise<string | null> {
 	const check = await runCommand(pythonPath, ["-c", "import rapidfuzz; print(rapidfuzz.__version__)"], projectRoot);
