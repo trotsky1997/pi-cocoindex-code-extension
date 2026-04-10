@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -9,7 +9,7 @@ const STATUS_KEY = "cocoindex";
 
 type StatusState = {
 	available: boolean;
-	busy: false | "checking" | "indexing" | "searching";
+	busy: false | "checking" | "indexing" | "patching" | "searching";
 	initialized: boolean;
 	projectRoot: string;
 	lastSummary: string;
@@ -40,6 +40,12 @@ type CommandResult = {
 	combined: string;
 };
 
+type PatchResult = {
+	status: "already_patched" | "failed" | "missing" | "patched" | "skipped";
+	message: string;
+	targetPath?: string;
+};
+
 const SEARCH_PARAMS = Type.Object({
 	query: Type.String({ description: "Natural language query or code snippet to search for." }),
 	limit: Type.Optional(
@@ -58,6 +64,32 @@ const SEARCH_PARAMS = Type.Object({
 		Type.Array(Type.String(), { description: "Filter by file path pattern(s) using glob wildcards" }),
 	),
 });
+
+const COMPAT_PATCH_MARKER = "null encoding_format, so force the standard float response here.";
+const SHARED_IMPORT_NEEDLE = "from dataclasses import dataclass\n";
+const VULNERABLE_LITELLM_BLOCK = `    else:
+        from cocoindex.ops.litellm import LiteLLMEmbedder
+
+        instance = LiteLLMEmbedder(settings.model)
+        query_prompt_name = None
+        logger.info("Embedding model (LiteLLM): %s", settings.model)
+`;
+const PATCHED_LITELLM_BLOCK = `    else:
+        from cocoindex.ops.litellm import LiteLLMEmbedder
+
+        litellm_kwargs = {}
+        # Some OpenAI-compatible embedding APIs reject LiteLLM's default
+        # null encoding_format, so force the standard float response here.
+        if settings.model.startswith("openai/") or os.environ.get("OPENAI_API_BASE"):
+            litellm_kwargs["encoding_format"] = "float"
+
+        instance = LiteLLMEmbedder(settings.model, **litellm_kwargs)
+        query_prompt_name = None
+        logger.info("Embedding model (LiteLLM): %s", settings.model)
+`;
+
+let patchPromise: Promise<PatchResult> | null = null;
+let patchResult: PatchResult | null = null;
 
 function createDefaultState(): StatusState {
 	return {
@@ -80,6 +112,39 @@ async function pathExists(target: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+function isCompatParameterError(text: string): boolean {
+	return text.includes("code': 20015") || text.includes('"code":20015') || text.includes("The parameter is invalid. Please check again.");
+}
+
+function parseShebangInterpreter(scriptText: string): string | null {
+	const [firstLine = ""] = scriptText.split(/\r?\n/, 1);
+	if (!firstLine.startsWith("#!")) return null;
+	const shebang = firstLine.slice(2).trim();
+	if (!shebang) return null;
+	const parts = shebang.split(/\s+/);
+	if (parts[0].endsWith("env") && parts[1]) {
+		return parts[1];
+	}
+	return parts[0] ?? null;
+}
+
+async function findCommandPath(command: string): Promise<string | null> {
+	if (command.includes(path.sep)) {
+		return (await pathExists(command)) ? command : null;
+	}
+
+	const pathValue = process.env.PATH ?? "";
+	for (const dir of pathValue.split(path.delimiter)) {
+		if (!dir) continue;
+		const candidate = path.join(dir, command);
+		if (await pathExists(candidate)) {
+			return candidate;
+		}
+	}
+
+	return null;
 }
 
 async function findProjectRoot(startDir: string): Promise<string> {
@@ -164,6 +229,136 @@ function runCommand(command: string, args: string[], cwd: string, signal?: Abort
 	});
 }
 
+function buildCompatibilityPatchedSource(source: string): string | null {
+	if (source.includes(COMPAT_PATCH_MARKER) || source.includes('litellm_kwargs["encoding_format"] = "float"')) {
+		return source;
+	}
+
+	let updated = source;
+	if (!updated.includes("\nimport os\n")) {
+		if (!updated.includes(SHARED_IMPORT_NEEDLE)) {
+			return null;
+		}
+		updated = updated.replace(SHARED_IMPORT_NEEDLE, `${SHARED_IMPORT_NEEDLE}import os\n`);
+	}
+
+	if (!updated.includes(VULNERABLE_LITELLM_BLOCK)) {
+		return null;
+	}
+
+	return updated.replace(VULNERABLE_LITELLM_BLOCK, PATCHED_LITELLM_BLOCK);
+}
+
+async function locateSharedModulePath(projectRoot: string): Promise<string> {
+	const cccPath = await findCommandPath("ccc");
+	if (!cccPath) {
+		throw new Error("ccc not found on PATH");
+	}
+
+	const launcherText = await readFile(cccPath, "utf8");
+	const pythonHint = parseShebangInterpreter(launcherText);
+	if (!pythonHint) {
+		throw new Error(`Could not parse the ccc launcher at ${cccPath}`);
+	}
+
+	const pythonPath = pythonHint.includes(path.sep) ? pythonHint : (await findCommandPath(pythonHint)) ?? pythonHint;
+	const locateResult = await runCommand(
+		pythonPath,
+		["-c", "import cocoindex_code.shared as module; print(module.__file__)"],
+		projectRoot,
+	);
+	if (locateResult.code !== 0) {
+		throw new Error(locateResult.combined || "Failed to locate cocoindex_code.shared");
+	}
+
+	const sharedPath = locateResult.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	const sharedPathResult = sharedPath[sharedPath.length - 1];
+	if (!sharedPathResult) {
+		throw new Error("cocoindex_code.shared returned an empty path");
+	}
+
+	return sharedPathResult;
+}
+
+async function applyCompatibilityPatch(projectRoot: string): Promise<PatchResult> {
+	const cccPath = await findCommandPath("ccc");
+	if (!cccPath) {
+		return { status: "missing", message: "ccc not found on PATH" };
+	}
+
+	try {
+		const sharedPath = await locateSharedModulePath(projectRoot);
+		const source = await readFile(sharedPath, "utf8");
+		if (source.includes(COMPAT_PATCH_MARKER) || source.includes('litellm_kwargs["encoding_format"] = "float"')) {
+			return {
+				status: "already_patched",
+				message: `Compatibility patch already present at ${sharedPath}`,
+				targetPath: sharedPath,
+			};
+		}
+
+		const patchedSource = buildCompatibilityPatchedSource(source);
+		if (!patchedSource || patchedSource === source) {
+			return {
+				status: "skipped",
+				message: `Unsupported cocoindex_code.shared.py layout at ${sharedPath}; compatibility patch not applied.`,
+				targetPath: sharedPath,
+			};
+		}
+
+		await writeFile(sharedPath, patchedSource, "utf8");
+		const restartResult = await runCommand("ccc", ["daemon", "restart"], projectRoot);
+		const restartMessage =
+			restartResult.code === 0
+				? " and restarted the ccc daemon."
+				: `, but restarting the ccc daemon failed: ${restartResult.combined || "unknown error"}`;
+		return {
+			status: "patched",
+			message: `Patched ${sharedPath}${restartMessage}`,
+			targetPath: sharedPath,
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { status: "failed", message: `Compatibility patch failed: ${message}` };
+	}
+}
+
+async function ensureCompatibilityPatch(projectRoot: string, options: { force?: boolean } = {}): Promise<PatchResult> {
+	if (patchPromise) {
+		return patchPromise;
+	}
+	if (!options.force && patchResult) {
+		return patchResult;
+	}
+
+	patchPromise = applyCompatibilityPatch(projectRoot)
+		.then((result) => {
+			patchResult = result;
+			return result;
+		})
+		.finally(() => {
+			patchPromise = null;
+		});
+
+	return patchPromise;
+}
+
+function buildCompatFailureMessage(message: string, compatResult: PatchResult | null): string {
+	if (!isCompatParameterError(message)) {
+		return message;
+	}
+
+	const patchSummary = compatResult ? compatResult.message : "Compatibility patch status is unavailable.";
+	const retryHint =
+		compatResult?.status === "patched" || compatResult?.status === "already_patched"
+			? " If the old daemon is still serving requests, rerun `/ccc-patch` or retry once."
+			: " Run `/ccc-patch` to retry the self-heal patch.";
+	return `Detected the known LiteLLM/OpenAI-compatible embedding error from cocoindex-code. ${patchSummary}${retryHint}`;
+}
+
 function parseSearchResults(stdout: string): SearchResult[] {
 	const matches = [...stdout.matchAll(/--- Result \d+ \(score: ([0-9.]+)\) ---\nFile: (.+?):(\d+)-(\d+) \[([^\]]+)\]\n([\s\S]*?)(?=\n--- Result \d+ \(score:|$)/g)];
 	return matches.map((match) => ({
@@ -212,12 +407,53 @@ async function refreshState(ctx: ExtensionContext, state: StatusState): Promise<
 export default function cocoindexExtension(pi: ExtensionAPI) {
 	const state = createDefaultState();
 
+	const notifyPatchResult = (ctx: ExtensionContext, result: PatchResult, manual = false) => {
+		if (result.status === "patched") {
+			ctx.ui.notify(`ccc patch: ${result.message}`, "info");
+			return;
+		}
+		if (manual) {
+			ctx.ui.notify(`ccc patch: ${result.message}`, result.status === "failed" || result.status === "missing" || result.status === "skipped" ? "warning" : "info");
+			return;
+		}
+		if (result.status === "failed" || result.status === "skipped") {
+			ctx.ui.notify(`ccc patch: ${result.message}`, "warning");
+		}
+	};
+
+	const runPatchPreflight = async (ctx: ExtensionContext, options: { force?: boolean; manual?: boolean } = {}) => {
+		state.projectRoot = await findProjectRoot(process.cwd());
+		const previousBusy = state.busy;
+		state.busy = "patching";
+		renderStatus(ctx, state);
+		const result = await ensureCompatibilityPatch(state.projectRoot, { force: options.force });
+		if (state.busy === "patching") {
+			state.busy = previousBusy === "patching" ? false : previousBusy;
+		}
+		renderStatus(ctx, state);
+		notifyPatchResult(ctx, result, options.manual);
+		return result;
+	};
+
+	const kickOffPatchPreflight = (ctx: ExtensionContext) => {
+		if (patchPromise || patchResult) return;
+		void runPatchPreflight(ctx).catch((error) => {
+			if (state.busy === "patching") {
+				state.busy = false;
+			}
+			renderStatus(ctx, state);
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`ccc patch: ${message}`, "warning");
+		});
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		state.busy = "checking";
 		renderStatus(ctx, state);
 		await refreshState(ctx, state);
 		state.busy = false;
 		renderStatus(ctx, state);
+		kickOffPatchPreflight(ctx);
 	});
 
 	pi.on("session_switch", async (event, ctx) => {
@@ -227,6 +463,7 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 		await refreshState(ctx, state);
 		state.busy = false;
 		renderStatus(ctx, state);
+		kickOffPatchPreflight(ctx);
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
@@ -242,7 +479,18 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 			await refreshState(ctx, state);
 			state.busy = false;
 			renderStatus(ctx, state);
-			ctx.ui.notify(`ccc: ${state.lastSummary}`, state.available ? "info" : "warning");
+			const compatResult = await runPatchPreflight(ctx);
+			const patchSuffix = compatResult ? ` | patch: ${compatResult.status}` : "";
+			const level = compatResult.status === "failed" || compatResult.status === "missing" || compatResult.status === "skipped" || !state.available ? "warning" : "info";
+			ctx.ui.notify(`ccc: ${state.lastSummary}${patchSuffix}`, level);
+		},
+	});
+
+	pi.registerCommand("ccc-patch", {
+		description: "Apply the cocoindex compatibility patch and restart the ccc daemon",
+		handler: async (_args, ctx) => {
+			await runPatchPreflight(ctx, { force: true, manual: true });
+			await refreshState(ctx, state);
 		},
 	});
 
@@ -259,6 +507,10 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			const params = rawParams as SearchParams;
 			state.projectRoot = await findProjectRoot(process.cwd());
+			let compatResult: PatchResult | null = await ensureCompatibilityPatch(state.projectRoot);
+			if (compatResult.status === "patched") {
+				onUpdate?.({ content: [{ type: "text", text: "Applied the ccc compatibility patch." }] });
+			}
 			state.available = true;
 			state.busy = params.refresh_index === false ? "searching" : "indexing";
 			renderStatus(ctx, state);
@@ -283,7 +535,7 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 				}
 
 				if (commandResult.code !== 0) {
-					throw new Error(commandResult.combined || "ccc search failed");
+					throw new Error(buildCompatFailureMessage(commandResult.combined || "ccc search failed", compatResult));
 				}
 
 				const results = parseSearchResults(commandResult.stdout);
@@ -303,16 +555,20 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 					},
 				};
 			} catch (error) {
+				let message = error instanceof Error ? error.message : String(error);
+				message = buildCompatFailureMessage(message, compatResult);
 				state.busy = false;
-				state.lastSummary = error instanceof Error ? error.message : "search failed";
+				state.lastSummary = message;
 				if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
 					state.available = false;
 					state.lastSummary = "ccc missing";
 				}
+				if (compatResult.status === "missing") {
+					state.available = false;
+				}
 				state.initialized = false;
 				renderStatus(ctx, state);
 
-				const message = error instanceof Error ? error.message : String(error);
 				return {
 					content: [{ type: "text", text: `CocoIndex search failed: ${message}` }],
 					details: {

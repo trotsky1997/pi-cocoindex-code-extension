@@ -66,6 +66,7 @@ The package gives you:
 
 - a `search` tool for semantic code search
 - a `/ccc-status` command
+- a `/ccc-patch` command to force a compatibility self-heal after `ccc` upgrades
 - a footer status indicator showing whether CocoIndex is available and initialized
 - the `ccc` skill for agent-side search workflow guidance
 
@@ -80,6 +81,7 @@ search error handling retry logic
 The extension will automatically:
 
 - locate the project root
+- apply a startup compatibility patch for `cocoindex-code` installs that still send an incompatible LiteLLM embedding request to OpenAI-compatible APIs such as SiliconFlow
 - detect whether `.cocoindex_code/settings.yml` exists
 - run `ccc init` and `ccc index` on first search if needed
 - refresh footer status on new turns
@@ -88,6 +90,7 @@ The extension will automatically:
 
 - The extension currently wraps the local `ccc` CLI rather than embedding `ccc mcp` directly.
 - The `search` tool shape is intentionally kept close to the CocoIndex MCP interface.
+- The auto-patch is idempotent and only rewrites the known vulnerable `cocoindex_code.shared` block. If `ccc` is upgraded and the installed Python files change, use `/ccc-patch` to retry and inspect the reported result.
 - If you already have a global `ccc` skill installed, pi may prefer the first discovered skill with that name.
 
 ## Repository
