@@ -2,7 +2,7 @@
 
 Pi package that bundles two pieces together:
 
-- a `cocoindex-code` powered pi extension that exposes semantic code search as a tool
+- a `cocoindex-code` powered pi extension that exposes code search as a tool
 - a `ccc` skill that teaches the agent when to initialize, index, refresh, and search
 
 The goal is simple: make CocoIndex feel native inside pi without asking the agent to manually manage the full `ccc` lifecycle every time.
@@ -64,9 +64,9 @@ After installing, reload pi or start a new session.
 
 The package gives you:
 
-- a `search` tool for semantic code search
+- a `search` tool for BM25-backed code search
 - a `/ccc-status` command
-- a `/ccc-patch` command to force a compatibility self-heal after `ccc` upgrades
+- a `/ccc-patch` command that patches the installed `cocoindex-code` into local BM25 mode after installs/upgrades
 - a footer status indicator showing whether CocoIndex is available and initialized
 - the `ccc` skill for agent-side search workflow guidance
 
@@ -81,7 +81,7 @@ search error handling retry logic
 The extension will automatically:
 
 - locate the project root
-- apply a startup compatibility patch for `cocoindex-code` installs that still send an incompatible LiteLLM embedding request to OpenAI-compatible APIs such as SiliconFlow
+- patch `cocoindex-code` into local BM25 mode, switch `~/.cocoindex_code/global_settings.yml` to `provider: bm25`, and keep the BM25 FTS cache in `target_sqlite.db`
 - detect whether `.cocoindex_code/settings.yml` exists
 - run `ccc init` and `ccc index` on first search if needed
 - refresh footer status on new turns
@@ -90,7 +90,8 @@ The extension will automatically:
 
 - The extension currently wraps the local `ccc` CLI rather than embedding `ccc mcp` directly.
 - The `search` tool shape is intentionally kept close to the CocoIndex MCP interface.
-- The auto-patch is idempotent and only rewrites the known vulnerable `cocoindex_code.shared` block. If `ccc` is upgraded and the installed Python files change, use `/ccc-patch` to retry and inspect the reported result.
+- The auto-patch is idempotent: it rewrites known `cocoindex-code` Python blocks, enables a cached SQLite FTS5/BM25 index, and preserves existing `envs` in `global_settings.yml`. If `ccc` is upgraded, use `/ccc-patch` to retry and inspect the result.
+- BM25 ranking runs inside SQLite FTS5; query normalization is cached in-process, the extension now attempts to install `rapidfuzz` into the `ccc` Python environment for fuzzy reranking, and NumPy is only used for a tiny compatibility vector with reused batch allocations so indexing stays local and cheap.
 - If you already have a global `ccc` skill installed, pi may prefer the first discovered skill with that name.
 
 ## Repository

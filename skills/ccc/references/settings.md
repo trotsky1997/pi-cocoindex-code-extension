@@ -8,7 +8,7 @@ Shared across all projects. Controls the embedding model and extra environment v
 
 ```yaml
 embedding:
-  provider: sentence-transformers   # or "litellm" (default when provider is omitted)
+  provider: bm25                    # or "sentence-transformers" / "litellm"
   model: sentence-transformers/all-MiniLM-L6-v2
   device: mps                       # optional: cpu, cuda, mps (auto-detected if omitted)
 
@@ -20,12 +20,22 @@ envs:                               # extra environment variables for the daemon
 
 | Field | Description |
 |-------|-------------|
-| `embedding.provider` | `sentence-transformers` for local models, `litellm` (or omit) for cloud/remote models |
+| `embedding.provider` | `bm25` for local lexical search after this extension patches `cocoindex-code`, `sentence-transformers` for local embedding models, `litellm` (or omit) for cloud/remote models |
 | `embedding.model` | Model identifier — format depends on provider (see examples below) |
 | `embedding.device` | Optional. `cpu`, `cuda`, or `mps`. Auto-detected if omitted. Only relevant for `sentence-transformers`. |
 | `envs` | Key-value map of environment variables injected into the daemon. Use for API keys not already in the shell environment. |
 
 ### Embedding Model Examples
+
+**BM25 (local, no API key or embedding calls after `/ccc-patch`):**
+
+```yaml
+embedding:
+  provider: bm25
+  model: bm25
+```
+
+The Pi extension patches `cocoindex-code` so `ccc index` builds a cached SQLite FTS5 table (`code_chunks_fts`) inside `target_sqlite.db`, and `ccc search` ranks chunks with SQLite BM25. Repeated searches reuse that cache; no-op index runs skip rebuilding it. Query normalization is cached in-process, the extension can install `rapidfuzz` into the `ccc` Python environment for fuzzy reranking, and the BM25 compatibility vector reuses cached NumPy batches instead of allocating large embeddings.
 
 **Local (sentence-transformers, no API key needed):**
 
@@ -79,7 +89,7 @@ For the full list of supported cloud providers and model identifiers, see [LiteL
 
 ### Important
 
-Switching embedding models changes vector dimensions — you must re-index after changing the model:
+Switching embedding models changes vector dimensions. Switching into or out of BM25 also changes the search backend — re-index after changing the model/provider:
 
 ```bash
 ccc reset && ccc index

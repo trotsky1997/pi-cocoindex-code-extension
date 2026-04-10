@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 const STATUS_KEY = "cocoindex";
+const PATCH_SCRIPT_PATH = decodeURIComponent(new URL("../scripts/cocoindex_bm25_patch.py", import.meta.url).pathname);
 
 type StatusState = {
 	available: boolean;
@@ -40,10 +40,20 @@ type CommandResult = {
 	combined: string;
 };
 
+type PatchStatus = "already_patched" | "failed" | "missing" | "patched" | "skipped";
+
 type PatchResult = {
-	status: "already_patched" | "failed" | "missing" | "patched" | "skipped";
+	status: PatchStatus;
 	message: string;
-	targetPath?: string;
+	changedPaths: string[];
+	scannedPaths: Record<string, string>;
+};
+
+type PatchScriptPayload = {
+	status?: PatchStatus;
+	message?: string;
+	changed_paths?: string[];
+	scanned_paths?: Record<string, string>;
 };
 
 const SEARCH_PARAMS = Type.Object({
@@ -64,29 +74,6 @@ const SEARCH_PARAMS = Type.Object({
 		Type.Array(Type.String(), { description: "Filter by file path pattern(s) using glob wildcards" }),
 	),
 });
-
-const COMPAT_PATCH_MARKER = "null encoding_format, so force the standard float response here.";
-const SHARED_IMPORT_NEEDLE = "from dataclasses import dataclass\n";
-const VULNERABLE_LITELLM_BLOCK = `    else:
-        from cocoindex.ops.litellm import LiteLLMEmbedder
-
-        instance = LiteLLMEmbedder(settings.model)
-        query_prompt_name = None
-        logger.info("Embedding model (LiteLLM): %s", settings.model)
-`;
-const PATCHED_LITELLM_BLOCK = `    else:
-        from cocoindex.ops.litellm import LiteLLMEmbedder
-
-        litellm_kwargs = {}
-        # Some OpenAI-compatible embedding APIs reject LiteLLM's default
-        # null encoding_format, so force the standard float response here.
-        if settings.model.startswith("openai/") or os.environ.get("OPENAI_API_BASE"):
-            litellm_kwargs["encoding_format"] = "float"
-
-        instance = LiteLLMEmbedder(settings.model, **litellm_kwargs)
-        query_prompt_name = None
-        logger.info("Embedding model (LiteLLM): %s", settings.model)
-`;
 
 let patchPromise: Promise<PatchResult> | null = null;
 let patchResult: PatchResult | null = null;
@@ -112,10 +99,6 @@ async function pathExists(target: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-function isCompatParameterError(text: string): boolean {
-	return text.includes("code': 20015") || text.includes('"code":20015') || text.includes("The parameter is invalid. Please check again.");
 }
 
 function parseShebangInterpreter(scriptText: string): string | null {
@@ -229,27 +212,7 @@ function runCommand(command: string, args: string[], cwd: string, signal?: Abort
 	});
 }
 
-function buildCompatibilityPatchedSource(source: string): string | null {
-	if (source.includes(COMPAT_PATCH_MARKER) || source.includes('litellm_kwargs["encoding_format"] = "float"')) {
-		return source;
-	}
-
-	let updated = source;
-	if (!updated.includes("\nimport os\n")) {
-		if (!updated.includes(SHARED_IMPORT_NEEDLE)) {
-			return null;
-		}
-		updated = updated.replace(SHARED_IMPORT_NEEDLE, `${SHARED_IMPORT_NEEDLE}import os\n`);
-	}
-
-	if (!updated.includes(VULNERABLE_LITELLM_BLOCK)) {
-		return null;
-	}
-
-	return updated.replace(VULNERABLE_LITELLM_BLOCK, PATCHED_LITELLM_BLOCK);
-}
-
-async function locateSharedModulePath(projectRoot: string): Promise<string> {
+async function resolveCccPython(projectRoot: string): Promise<string> {
 	const cccPath = await findCommandPath("ccc");
 	if (!cccPath) {
 		throw new Error("ccc not found on PATH");
@@ -261,68 +224,122 @@ async function locateSharedModulePath(projectRoot: string): Promise<string> {
 		throw new Error(`Could not parse the ccc launcher at ${cccPath}`);
 	}
 
-	const pythonPath = pythonHint.includes(path.sep) ? pythonHint : (await findCommandPath(pythonHint)) ?? pythonHint;
-	const locateResult = await runCommand(
-		pythonPath,
-		["-c", "import cocoindex_code.shared as module; print(module.__file__)"],
-		projectRoot,
-	);
-	if (locateResult.code !== 0) {
-		throw new Error(locateResult.combined || "Failed to locate cocoindex_code.shared");
+	if (pythonHint.includes(path.sep)) {
+		return pythonHint;
 	}
 
-	const sharedPath = locateResult.stdout
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean);
-	const sharedPathResult = sharedPath[sharedPath.length - 1];
-	if (!sharedPathResult) {
-		throw new Error("cocoindex_code.shared returned an empty path");
+	const resolved = await findCommandPath(pythonHint);
+	if (!resolved) {
+		throw new Error(`Could not resolve the ccc Python interpreter (${pythonHint})`);
 	}
-
-	return sharedPathResult;
+	return resolved;
 }
 
-async function applyCompatibilityPatch(projectRoot: string): Promise<PatchResult> {
+
+async function detectRapidFuzzVersion(pythonPath: string, projectRoot: string): Promise<string | null> {
+	const check = await runCommand(pythonPath, ["-c", "import rapidfuzz; print(rapidfuzz.__version__)"], projectRoot);
+	if (check.code !== 0) {
+		return null;
+	}
+	const lines = check.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	return lines[lines.length - 1] ?? "installed";
+}
+
+async function ensureRapidFuzz(pythonPath: string, projectRoot: string): Promise<string> {
+	const existing = await detectRapidFuzzVersion(pythonPath, projectRoot);
+	if (existing) {
+		return `RapidFuzz ${existing} is available for fuzzy reranking.`;
+	}
+
+	const uvPath = await findCommandPath("uv");
+	if (!uvPath) {
+		return "RapidFuzz is not installed; falling back to the built-in fuzzy reranker.";
+	}
+
+	const install = await runCommand(uvPath, ["pip", "install", "--python", pythonPath, "rapidfuzz"], projectRoot);
+	if (install.code !== 0) {
+		return `RapidFuzz install failed; using the built-in fuzzy reranker instead. ${install.combined || ""}`.trim();
+	}
+
+	const installed = await detectRapidFuzzVersion(pythonPath, projectRoot);
+	if (installed) {
+		return `Installed RapidFuzz ${installed} for BM25 reranking.`;
+	}
+	return "RapidFuzz install completed, but the module is still unavailable; using the built-in fuzzy reranker.";
+}
+
+function parsePatchPayload(output: string): PatchScriptPayload | null {
+	for (const line of output.split(/\r?\n/).reverse()) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			return JSON.parse(trimmed) as PatchScriptPayload;
+		} catch {
+			continue;
+		}
+	}
+	return null;
+}
+
+function normalizePatchResult(payload: PatchScriptPayload | null, fallbackMessage: string): PatchResult {
+	return {
+		status: payload?.status ?? "failed",
+		message: payload?.message ?? fallbackMessage,
+		changedPaths: payload?.changed_paths ?? [],
+		scannedPaths: payload?.scanned_paths ?? {},
+	};
+}
+
+async function applyBm25Patch(projectRoot: string): Promise<PatchResult> {
 	const cccPath = await findCommandPath("ccc");
 	if (!cccPath) {
-		return { status: "missing", message: "ccc not found on PATH" };
+		return {
+			status: "missing",
+			message: "ccc not found on PATH",
+			changedPaths: [],
+			scannedPaths: {},
+		};
+	}
+	if (!(await pathExists(PATCH_SCRIPT_PATH))) {
+		return {
+			status: "failed",
+			message: `Patch helper script not found at ${PATCH_SCRIPT_PATH}`,
+			changedPaths: [],
+			scannedPaths: {},
+		};
 	}
 
 	try {
-		const sharedPath = await locateSharedModulePath(projectRoot);
-		const source = await readFile(sharedPath, "utf8");
-		if (source.includes(COMPAT_PATCH_MARKER) || source.includes('litellm_kwargs["encoding_format"] = "float"')) {
-			return {
-				status: "already_patched",
-				message: `Compatibility patch already present at ${sharedPath}`,
-				targetPath: sharedPath,
-			};
+		const pythonPath = await resolveCccPython(projectRoot);
+		const rapidFuzzMessage = await ensureRapidFuzz(pythonPath, projectRoot);
+		const patchCommand = await runCommand(pythonPath, [PATCH_SCRIPT_PATH], projectRoot);
+		const payload = parsePatchPayload(patchCommand.stdout);
+		const result = normalizePatchResult(payload, patchCommand.combined || "BM25 patch failed");
+		if (patchCommand.code !== 0 && result.status !== "patched") {
+			return { ...result, status: "failed", message: `${result.message} ${rapidFuzzMessage}`.trim() };
 		}
-
-		const patchedSource = buildCompatibilityPatchedSource(source);
-		if (!patchedSource || patchedSource === source) {
-			return {
-				status: "skipped",
-				message: `Unsupported cocoindex_code.shared.py layout at ${sharedPath}; compatibility patch not applied.`,
-				targetPath: sharedPath,
-			};
-		}
-
-		await writeFile(sharedPath, patchedSource, "utf8");
-		const restartResult = await runCommand("ccc", ["daemon", "restart"], projectRoot);
-		const restartMessage =
-			restartResult.code === 0
-				? " and restarted the ccc daemon."
-				: `, but restarting the ccc daemon failed: ${restartResult.combined || "unknown error"}`;
-		return {
-			status: "patched",
-			message: `Patched ${sharedPath}${restartMessage}`,
-			targetPath: sharedPath,
+		const resultWithRapidFuzz = {
+			...result,
+			message: `${result.message} ${rapidFuzzMessage}`.trim(),
 		};
+		if (result.status === "patched") {
+			const restart = await runCommand("ccc", ["daemon", "restart"], projectRoot);
+			if (restart.code !== 0) {
+				return {
+					...resultWithRapidFuzz,
+					message: `${resultWithRapidFuzz.message} Restarting the ccc daemon failed: ${restart.combined || "unknown error"}`,
+				};
+			}
+		}
+		return resultWithRapidFuzz;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		return { status: "failed", message: `Compatibility patch failed: ${message}` };
+		return {
+			status: "failed",
+			message: `BM25 patch failed: ${message}`,
+			changedPaths: [],
+			scannedPaths: {},
+		};
 	}
 }
 
@@ -334,7 +351,7 @@ async function ensureCompatibilityPatch(projectRoot: string, options: { force?: 
 		return patchResult;
 	}
 
-	patchPromise = applyCompatibilityPatch(projectRoot)
+	patchPromise = applyBm25Patch(projectRoot)
 		.then((result) => {
 			patchResult = result;
 			return result;
@@ -346,17 +363,12 @@ async function ensureCompatibilityPatch(projectRoot: string, options: { force?: 
 	return patchPromise;
 }
 
-function buildCompatFailureMessage(message: string, compatResult: PatchResult | null): string {
-	if (!isCompatParameterError(message)) {
+function appendPatchContext(message: string, compatResult: PatchResult | null): string {
+	if (!compatResult) return message;
+	if (compatResult.status === "patched" || compatResult.status === "already_patched") {
 		return message;
 	}
-
-	const patchSummary = compatResult ? compatResult.message : "Compatibility patch status is unavailable.";
-	const retryHint =
-		compatResult?.status === "patched" || compatResult?.status === "already_patched"
-			? " If the old daemon is still serving requests, rerun `/ccc-patch` or retry once."
-			: " Run `/ccc-patch` to retry the self-heal patch.";
-	return `Detected the known LiteLLM/OpenAI-compatible embedding error from cocoindex-code. ${patchSummary}${retryHint}`;
+	return `${message}\nBM25 patch status: ${compatResult.message}`;
 }
 
 function parseSearchResults(stdout: string): SearchResult[] {
@@ -371,11 +383,7 @@ function parseSearchResults(stdout: string): SearchResult[] {
 	}));
 }
 
-async function ensureSearchReady(
-	projectRoot: string,
-	signal: AbortSignal | undefined,
-	onUpdate: (message: string) => void,
-): Promise<void> {
+async function ensureSearchReady(projectRoot: string, signal: AbortSignal | undefined, onUpdate: (message: string) => void): Promise<void> {
 	onUpdate("Initializing cocoindex project...");
 	const initResult = await runCommand("ccc", ["init"], projectRoot, signal);
 	if (initResult.code !== 0) {
@@ -409,15 +417,16 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 
 	const notifyPatchResult = (ctx: ExtensionContext, result: PatchResult, manual = false) => {
 		if (result.status === "patched") {
-			ctx.ui.notify(`ccc patch: ${result.message}`, "info");
+			ctx.ui.notify(`ccc bm25: ${result.message}`, "info");
 			return;
 		}
 		if (manual) {
-			ctx.ui.notify(`ccc patch: ${result.message}`, result.status === "failed" || result.status === "missing" || result.status === "skipped" ? "warning" : "info");
+			const level = result.status === "failed" || result.status === "missing" || result.status === "skipped" ? "warning" : "info";
+			ctx.ui.notify(`ccc bm25: ${result.message}`, level);
 			return;
 		}
 		if (result.status === "failed" || result.status === "skipped") {
-			ctx.ui.notify(`ccc patch: ${result.message}`, "warning");
+			ctx.ui.notify(`ccc bm25: ${result.message}`, "warning");
 		}
 	};
 
@@ -443,7 +452,7 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 			}
 			renderStatus(ctx, state);
 			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`ccc patch: ${message}`, "warning");
+			ctx.ui.notify(`ccc bm25: ${message}`, "warning");
 		});
 	};
 
@@ -472,7 +481,7 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("ccc-status", {
-		description: "Refresh the cocoindex status indicator",
+		description: "Refresh the cocoindex status indicator and BM25 patch status",
 		handler: async (_args, ctx) => {
 			state.busy = "checking";
 			renderStatus(ctx, state);
@@ -480,14 +489,13 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 			state.busy = false;
 			renderStatus(ctx, state);
 			const compatResult = await runPatchPreflight(ctx);
-			const patchSuffix = compatResult ? ` | patch: ${compatResult.status}` : "";
 			const level = compatResult.status === "failed" || compatResult.status === "missing" || compatResult.status === "skipped" || !state.available ? "warning" : "info";
-			ctx.ui.notify(`ccc: ${state.lastSummary}${patchSuffix}`, level);
+			ctx.ui.notify(`ccc: ${state.lastSummary} | bm25 patch: ${compatResult.status}`, level);
 		},
 	});
 
 	pi.registerCommand("ccc-patch", {
-		description: "Apply the cocoindex compatibility patch and restart the ccc daemon",
+		description: "Patch cocoindex-code into BM25 mode and restart the ccc daemon",
 		handler: async (_args, ctx) => {
 			await runPatchPreflight(ctx, { force: true, manual: true });
 			await refreshState(ctx, state);
@@ -497,10 +505,10 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "search",
 		label: "CocoIndex Search",
-		description: "Semantic code search across the current codebase using cocoindex-code.",
-		promptSnippet: "Use this to find code by meaning rather than exact string matches.",
+		description: "Code search across the current codebase using cocoindex-code.",
+		promptSnippet: "Use this to search the codebase through cocoindex-code's BM25-aware search backend.",
 		promptGuidelines: [
-			"Use for conceptual code search, unfamiliar codebases, and locating implementations without exact identifiers.",
+			"Use for code search, implementation lookup, and retrieval after the extension patches cocoindex-code into BM25 mode.",
 			"Start with a small limit, then paginate with offset if the first results are relevant.",
 		],
 		parameters: SEARCH_PARAMS,
@@ -509,9 +517,9 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 			state.projectRoot = await findProjectRoot(process.cwd());
 			let compatResult: PatchResult | null = await ensureCompatibilityPatch(state.projectRoot);
 			if (compatResult.status === "patched") {
-				onUpdate?.({ content: [{ type: "text", text: "Applied the ccc compatibility patch." }] });
+				onUpdate?.({ content: [{ type: "text", text: "Enabled BM25 mode for cocoindex-code." }] });
 			}
-			state.available = true;
+			state.available = compatResult.status !== "missing";
 			state.busy = params.refresh_index === false ? "searching" : "indexing";
 			renderStatus(ctx, state);
 
@@ -535,7 +543,7 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 				}
 
 				if (commandResult.code !== 0) {
-					throw new Error(buildCompatFailureMessage(commandResult.combined || "ccc search failed", compatResult));
+					throw new Error(appendPatchContext(commandResult.combined || "ccc search failed", compatResult));
 				}
 
 				const results = parseSearchResults(commandResult.stdout);
@@ -555,16 +563,12 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 					},
 				};
 			} catch (error) {
-				let message = error instanceof Error ? error.message : String(error);
-				message = buildCompatFailureMessage(message, compatResult);
+				const message = appendPatchContext(error instanceof Error ? error.message : String(error), compatResult);
 				state.busy = false;
 				state.lastSummary = message;
 				if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
 					state.available = false;
 					state.lastSummary = "ccc missing";
-				}
-				if (compatResult.status === "missing") {
-					state.available = false;
 				}
 				state.initialized = false;
 				renderStatus(ctx, state);
