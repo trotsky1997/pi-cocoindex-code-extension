@@ -5,7 +5,17 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 
 const STATUS_KEY = "cocoindex";
-const PATCH_SCRIPT_PATH = decodeURIComponent(new URL("../scripts/cocoindex_bm25_patch.py", import.meta.url).pathname);
+
+function resolveFileUrlPath(relativePath: string): string {
+	const url = new URL(relativePath, import.meta.url);
+	let pathname = decodeURIComponent(url.pathname);
+	if (process.platform === "win32" && /^\/[A-Za-z]:/.test(pathname)) {
+		pathname = pathname.slice(1);
+	}
+	return path.normalize(pathname);
+}
+
+const PATCH_SCRIPT_PATH = resolveFileUrlPath("../scripts/cocoindex_bm25_patch.py");
 
 type StatusState = {
 	available: boolean;
