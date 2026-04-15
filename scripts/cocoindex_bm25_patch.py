@@ -12,11 +12,11 @@ DESIRED_SHARED = '''"""Shared context keys, embedder factory, and CodeChunk sche
 
 from __future__ import annotations
 
+import importlib.util
 import logging
-import os
 import pathlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Union
+from typing import TYPE_CHECKING, Annotated, NamedTuple, Union
 
 import cocoindex as coco
 import numpy as np
@@ -33,6 +33,7 @@ from .settings import EmbeddingSettings
 logger = logging.getLogger(__name__)
 
 SBERT_PREFIX = "sbert/"
+DEFAULT_LITELLM_MIN_INTERVAL_MS = 5
 
 # Models that define a "query" prompt for asymmetric retrieval.
 _QUERY_PROMPT_MODELS = {"nomic-ai/nomic-embed-code", "nomic-ai/CodeRankEmbed"}
@@ -89,6 +90,41 @@ embedder: Embedder | None = None
 query_prompt_name: str | None = None
 
 
+def is_sentence_transformers_installed() -> bool:
+    """Return True if the `sentence_transformers` package can be imported.
+
+    Uses `find_spec` rather than `import` to avoid triggering the slow,
+    torch-loading import as a side effect of the check.
+    """
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+class EmbeddingCheckResult(NamedTuple):
+    """Outcome of a single embed-test call. See `check_embedding`.
+
+    Exactly one of ``dim`` / ``error`` is set: ``error is None`` means success.
+    """
+
+    dim: int | None
+    error: str | None
+
+
+async def check_embedding(embedder: Embedder) -> EmbeddingCheckResult:
+    """Run a single embed call against *embedder* and report dim or error.
+
+    Never raises. Used by both the daemon's doctor path (`daemon._check_model`)
+    and the CLI's init flow (`cli._test_embedding_model`).
+    """
+    try:
+        vec = await embedder.embed("hello world")
+        return EmbeddingCheckResult(dim=len(vec), error=None)
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}".splitlines()[0]
+        if len(msg) > 500:
+            msg = msg[:500] + "..."
+        return EmbeddingCheckResult(dim=None, error=msg)
+
+
 def create_embedder(settings: EmbeddingSettings) -> Embedder:
     """Create and return an embedder instance based on settings.
 
@@ -117,17 +153,23 @@ def create_embedder(settings: EmbeddingSettings) -> Embedder:
         )
         logger.info("Embedding model: %s | device: %s", settings.model, settings.device)
     else:
-        from cocoindex.ops.litellm import LiteLLMEmbedder
+        from .litellm_embedder import PacedLiteLLMEmbedder
 
-        litellm_kwargs = {}
-        # Some OpenAI-compatible embedding APIs reject LiteLLM's default
-        # null encoding_format, so force the standard float response here.
-        if settings.model.startswith("openai/") or os.environ.get("OPENAI_API_BASE"):
-            litellm_kwargs["encoding_format"] = "float"
-
-        instance = LiteLLMEmbedder(settings.model, **litellm_kwargs)
+        min_interval_ms = (
+            settings.min_interval_ms
+            if settings.min_interval_ms is not None
+            else DEFAULT_LITELLM_MIN_INTERVAL_MS
+        )
+        instance = PacedLiteLLMEmbedder(
+            settings.model,
+            min_interval_ms=min_interval_ms,
+        )
         query_prompt_name = None
-        logger.info("Embedding model (LiteLLM): %s", settings.model)
+        logger.info(
+            "Embedding model (LiteLLM): %s | min_interval_ms: %s",
+            settings.model,
+            min_interval_ms,
+        )
 
     embedder = instance
     return instance
@@ -459,14 +501,16 @@ async def query_codebase(
 '''
 
 INDEXER_INSERT_AFTER = "splitter = RecursiveSplitter()\n"
-INDEXER_HELPERS = '''\n\nBM25_TABLE = "code_chunks_fts"\n\n\ndef has_bm25_index(db: sqlite.ManagedConnection) -> bool:\n    \"\"\"Return True when the cached BM25 FTS table exists.\"\"\"\n    with db.readonly() as conn:\n        row = conn.execute(\n            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",\n            (BM25_TABLE,),\n        ).fetchone()\n    return row is not None\n\n\ndef refresh_bm25_index(db: sqlite.ManagedConnection) -> None:\n    \"\"\"Rebuild the cached BM25 FTS table from the vec chunk table.\"\"\"\n    with db.transaction() as conn:\n        conn.execute(f'DROP TABLE IF EXISTS {BM25_TABLE}')\n        conn.execute(\n            f\"\"\"\n            CREATE VIRTUAL TABLE {BM25_TABLE} USING fts5(\n                file_path UNINDEXED,\n                language UNINDEXED,\n                content,\n                start_line UNINDEXED,\n                end_line UNINDEXED,\n                tokenize='unicode61'\n            )\n            \"\"\"\n        )\n        conn.execute(\n            f\"\"\"\n            INSERT INTO {BM25_TABLE}(file_path, language, content, start_line, end_line)\n            SELECT file_path, language, content, start_line, end_line\n            FROM code_chunks_vec\n            \"\"\"\n        )\n        conn.execute(\n            f\"INSERT INTO {BM25_TABLE}({BM25_TABLE}) VALUES ('optimize')\"\n        )\n'''
+INDEXER_HELPERS = """\n\nBM25_TABLE = "code_chunks_fts"\n\n\ndef has_bm25_index(db: sqlite.ManagedConnection) -> bool:\n    \"\"\"Return True when the cached BM25 FTS table exists.\"\"\"\n    with db.readonly() as conn:\n        row = conn.execute(\n            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",\n            (BM25_TABLE,),\n        ).fetchone()\n    return row is not None\n\n\ndef refresh_bm25_index(db: sqlite.ManagedConnection) -> None:\n    \"\"\"Rebuild the cached BM25 FTS table from the vec chunk table.\"\"\"\n    with db.transaction() as conn:\n        conn.execute(f'DROP TABLE IF EXISTS {BM25_TABLE}')\n        conn.execute(\n            f\"\"\"\n            CREATE VIRTUAL TABLE {BM25_TABLE} USING fts5(\n                file_path UNINDEXED,\n                language UNINDEXED,\n                content,\n                start_line UNINDEXED,\n                end_line UNINDEXED,\n                tokenize='unicode61'\n            )\n            \"\"\"\n        )\n        conn.execute(\n            f\"\"\"\n            INSERT INTO {BM25_TABLE}(file_path, language, content, start_line, end_line)\n            SELECT file_path, language, content, start_line, end_line\n            FROM code_chunks_vec\n            \"\"\"\n        )\n        conn.execute(\n            f\"INSERT INTO {BM25_TABLE}({BM25_TABLE}) VALUES ('optimize')\"\n        )\n"""
 
 PROJECT_IMPORT_OLD = "from .indexer import indexer_main\n"
-PROJECT_IMPORT_NEW = "from .indexer import has_bm25_index, indexer_main, refresh_bm25_index\n"
-PROJECT_SHARED_IMPORT_OLD = '''from .shared import (\n    CODEBASE_DIR,\n    EMBEDDER,\n    SQLITE_DB,\n    Embedder,\n)\n'''
-PROJECT_SHARED_IMPORT_NEW = '''from .shared import (\n    BM25Embedder,\n    CODEBASE_DIR,\n    EMBEDDER,\n    SQLITE_DB,\n    Embedder,\n)\n'''
-PROJECT_RUN_INDEX_OLD = '''    async def _run_index_inner(\n        self,\n        on_progress: Callable[[IndexingProgress], None] | None = None,\n    ) -> None:\n        \"\"\"Run indexing (lock must already be held).\"\"\"\n        try:\n            handle = self._app.update()\n            async for snapshot in handle.watch():\n                file_stats = snapshot.stats.by_component.get("process_file")\n                if file_stats is not None:\n                    progress = IndexingProgress(\n                        num_execution_starts=file_stats.num_execution_starts,\n                        num_unchanged=file_stats.num_unchanged,\n                        num_adds=file_stats.num_adds,\n                        num_deletes=file_stats.num_deletes,\n                        num_reprocesses=file_stats.num_reprocesses,\n                        num_errors=file_stats.num_errors,\n                    )\n                    self._indexing_stats = progress\n                    if on_progress is not None:\n                        on_progress(progress)\n                    await asyncio.sleep(0.1)\n        finally:\n            self._initial_index_done.set()\n            self._indexing_stats = None\n'''
-PROJECT_RUN_INDEX_NEW = '''    async def _run_index_inner(\n        self,\n        on_progress: Callable[[IndexingProgress], None] | None = None,\n    ) -> None:\n        \"\"\"Run indexing (lock must already be held).\"\"\"\n        final_progress: IndexingProgress | None = None\n        try:\n            handle = self._app.update()\n            async for snapshot in handle.watch():\n                file_stats = snapshot.stats.by_component.get("process_file")\n                if file_stats is not None:\n                    progress = IndexingProgress(\n                        num_execution_starts=file_stats.num_execution_starts,\n                        num_unchanged=file_stats.num_unchanged,\n                        num_adds=file_stats.num_adds,\n                        num_deletes=file_stats.num_deletes,\n                        num_reprocesses=file_stats.num_reprocesses,\n                        num_errors=file_stats.num_errors,\n                    )\n                    final_progress = progress
+PROJECT_IMPORT_NEW = (
+    "from .indexer import has_bm25_index, indexer_main, refresh_bm25_index\n"
+)
+PROJECT_SHARED_IMPORT_OLD = """from .shared import (\n    CODEBASE_DIR,\n    EMBEDDER,\n    SQLITE_DB,\n    Embedder,\n)\n"""
+PROJECT_SHARED_IMPORT_NEW = """from .shared import (\n    BM25Embedder,\n    CODEBASE_DIR,\n    EMBEDDER,\n    SQLITE_DB,\n    Embedder,\n)\n"""
+PROJECT_RUN_INDEX_OLD = """    async def _run_index_inner(\n        self,\n        on_progress: Callable[[IndexingProgress], None] | None = None,\n    ) -> None:\n        \"\"\"Run indexing (lock must already be held).\"\"\"\n        try:\n            handle = self._app.update()\n            async for snapshot in handle.watch():\n                file_stats = snapshot.stats.by_component.get("process_file")\n                if file_stats is not None:\n                    progress = IndexingProgress(\n                        num_execution_starts=file_stats.num_execution_starts,\n                        num_unchanged=file_stats.num_unchanged,\n                        num_adds=file_stats.num_adds,\n                        num_deletes=file_stats.num_deletes,\n                        num_reprocesses=file_stats.num_reprocesses,\n                        num_errors=file_stats.num_errors,\n                    )\n                    self._indexing_stats = progress\n                    if on_progress is not None:\n                        on_progress(progress)\n                    await asyncio.sleep(0.1)\n        finally:\n            self._initial_index_done.set()\n            self._indexing_stats = None\n"""
+PROJECT_RUN_INDEX_NEW = """    async def _run_index_inner(\n        self,\n        on_progress: Callable[[IndexingProgress], None] | None = None,\n    ) -> None:\n        \"\"\"Run indexing (lock must already be held).\"\"\"\n        final_progress: IndexingProgress | None = None\n        try:\n            handle = self._app.update()\n            async for snapshot in handle.watch():\n                file_stats = snapshot.stats.by_component.get("process_file")\n                if file_stats is not None:\n                    progress = IndexingProgress(\n                        num_execution_starts=file_stats.num_execution_starts,\n                        num_unchanged=file_stats.num_unchanged,\n                        num_adds=file_stats.num_adds,\n                        num_deletes=file_stats.num_deletes,\n                        num_reprocesses=file_stats.num_reprocesses,\n                        num_errors=file_stats.num_errors,\n                    )\n                    final_progress = progress
                     self._indexing_stats = progress
                     if on_progress is not None:
                         on_progress(progress)
@@ -491,7 +535,7 @@ PROJECT_RUN_INDEX_NEW = '''    async def _run_index_inner(\n        self,\n     
         finally:
             self._initial_index_done.set()
             self._indexing_stats = None
-'''
+"""
 
 
 def load_source(module_name: str) -> tuple[Path, str]:
@@ -507,7 +551,16 @@ def replace_once(source: str, old: str, new: str, label: str) -> str:
 
 
 def patch_shared(source: str) -> str:
-    if PATCH_MARKER in source and "class BM25Embedder" in source and "_batch_cache" in source:
+    if (
+        PATCH_MARKER in source
+        and "class BM25Embedder" in source
+        and "_batch_cache" in source
+        and "def is_sentence_transformers_installed" in source
+        and "class EmbeddingCheckResult" in source
+        and "async def check_embedding" in source
+        and "DEFAULT_LITELLM_MIN_INTERVAL_MS" in source
+        and "PacedLiteLLMEmbedder" in source
+    ):
         return source
     if "def create_embedder" not in source or "class CodeChunk" not in source:
         raise RuntimeError("shared.py layout is not recognized.")
@@ -515,7 +568,11 @@ def patch_shared(source: str) -> str:
 
 
 def patch_query(source: str) -> str:
-    if PATCH_MARKER in source and "BM25_TABLE = \"code_chunks_fts\"" in source and "RERANK_FETCH_LIMIT" in source:
+    if (
+        PATCH_MARKER in source
+        and 'BM25_TABLE = "code_chunks_fts"' in source
+        and "RERANK_FETCH_LIMIT" in source
+    ):
         return source
     if "async def query_codebase" not in source or "def _knn_query" not in source:
         raise RuntimeError("query.py layout is not recognized.")
@@ -527,7 +584,9 @@ def patch_indexer(source: str) -> str:
         return source
     if INDEXER_INSERT_AFTER not in source:
         raise RuntimeError("indexer.py layout is not recognized.")
-    updated = source.replace(INDEXER_INSERT_AFTER, INDEXER_INSERT_AFTER + INDEXER_HELPERS, 1)
+    updated = source.replace(
+        INDEXER_INSERT_AFTER, INDEXER_INSERT_AFTER + INDEXER_HELPERS, 1
+    )
     if PATCH_MARKER not in updated:
         updated = updated.replace(
             '"""CocoIndex app for indexing codebases."""',
@@ -538,11 +597,24 @@ def patch_indexer(source: str) -> str:
 
 
 def patch_project(source: str) -> str:
-    if PATCH_MARKER in source and "refresh_bm25_index" in source and "BM25Embedder" in source:
+    if (
+        PATCH_MARKER in source
+        and "refresh_bm25_index" in source
+        and "BM25Embedder" in source
+    ):
         return source
-    updated = replace_once(source, PROJECT_IMPORT_OLD, PROJECT_IMPORT_NEW, "project import")
-    updated = replace_once(updated, PROJECT_SHARED_IMPORT_OLD, PROJECT_SHARED_IMPORT_NEW, "project shared import")
-    updated = replace_once(updated, PROJECT_RUN_INDEX_OLD, PROJECT_RUN_INDEX_NEW, "project run_index")
+    updated = replace_once(
+        source, PROJECT_IMPORT_OLD, PROJECT_IMPORT_NEW, "project import"
+    )
+    updated = replace_once(
+        updated,
+        PROJECT_SHARED_IMPORT_OLD,
+        PROJECT_SHARED_IMPORT_NEW,
+        "project shared import",
+    )
+    updated = replace_once(
+        updated, PROJECT_RUN_INDEX_OLD, PROJECT_RUN_INDEX_NEW, "project run_index"
+    )
     if PATCH_MARKER not in updated:
         updated = updated.replace(
             '"""Project management: wraps a CocoIndex Environment + App."""',
@@ -571,7 +643,9 @@ def ensure_global_settings_switched() -> bool:
     data["embedding"] = embedding
 
     if changed or not settings_path.exists():
-        settings_path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=False))
+        settings_path.write_text(
+            yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+        )
     return changed or not settings_path.exists()
 
 
@@ -598,7 +672,9 @@ def main() -> None:
 
         if changed_paths:
             status = "patched"
-            message = "Enabled BM25 mode for CocoIndex and updated cached search support."
+            message = (
+                "Enabled BM25 mode for CocoIndex and updated cached search support."
+            )
         else:
             status = "already_patched"
             message = "BM25 mode is already enabled for CocoIndex."

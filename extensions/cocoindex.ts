@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 const STATUS_KEY = "cocoindex";
@@ -15,7 +18,10 @@ function resolveFileUrlPath(relativePath: string): string {
 	return path.normalize(pathname);
 }
 
-const PATCH_SCRIPT_PATH = resolveFileUrlPath("../scripts/cocoindex_bm25_patch.py");
+const PATCH_SCRIPT_PATH = resolveFileUrlPath(
+	"../scripts/cocoindex_bm25_patch.py",
+);
+const PINNED_CCO_VERSION = "0.2.27";
 
 type StatusState = {
 	available: boolean;
@@ -50,13 +56,25 @@ type CommandResult = {
 	combined: string;
 };
 
-type PatchStatus = "already_patched" | "failed" | "missing" | "patched" | "skipped";
+type PatchStatus =
+	| "already_patched"
+	| "failed"
+	| "missing"
+	| "patched"
+	| "skipped";
+type PinStatus = "failed" | "mismatch" | "missing" | "pinned";
 
 type PatchResult = {
 	status: PatchStatus;
 	message: string;
 	changedPaths: string[];
 	scannedPaths: Record<string, string>;
+};
+
+type PinResult = {
+	status: PinStatus;
+	message: string;
+	installedVersion: string | null;
 };
 
 type PatchScriptPayload = {
@@ -67,21 +85,40 @@ type PatchScriptPayload = {
 };
 
 const SEARCH_PARAMS = Type.Object({
-	query: Type.String({ description: "Natural language query or code snippet to search for." }),
+	query: Type.String({
+		description: "Natural language query or code snippet to search for.",
+	}),
 	limit: Type.Optional(
-		Type.Integer({ minimum: 1, maximum: 100, default: 5, description: "Maximum number of results to return (1-100)" }),
+		Type.Integer({
+			minimum: 1,
+			maximum: 100,
+			default: 5,
+			description: "Maximum number of results to return (1-100)",
+		}),
 	),
 	offset: Type.Optional(
-		Type.Integer({ minimum: 0, default: 0, description: "Number of results to skip for pagination" }),
+		Type.Integer({
+			minimum: 0,
+			default: 0,
+			description: "Number of results to skip for pagination",
+		}),
 	),
 	refresh_index: Type.Optional(
-		Type.Boolean({ default: true, description: "Whether to incrementally refresh the index before searching" }),
+		Type.Boolean({
+			default: true,
+			description:
+				"Whether to incrementally refresh the index before searching",
+		}),
 	),
 	languages: Type.Optional(
-		Type.Array(Type.String(), { description: "Filter by language(s), e.g. ['python', 'typescript']" }),
+		Type.Array(Type.String(), {
+			description: "Filter by language(s), e.g. ['python', 'typescript']",
+		}),
 	),
 	paths: Type.Optional(
-		Type.Array(Type.String(), { description: "Filter by file path pattern(s) using glob wildcards" }),
+		Type.Array(Type.String(), {
+			description: "Filter by file path pattern(s) using glob wildcards",
+		}),
 	),
 });
 
@@ -99,7 +136,11 @@ function createDefaultState(): StatusState {
 }
 
 function isInitError(text: string): boolean {
-	return text.includes("Run `ccc init`") || text.includes("Not in an initialized project directory") || text.includes("Global settings not found");
+	return (
+		text.includes("Run `ccc init`") ||
+		text.includes("Not in an initialized project directory") ||
+		text.includes("Global settings not found")
+	);
 }
 
 async function pathExists(target: string): Promise<boolean> {
@@ -134,7 +175,9 @@ function windowsExecutableExtensions(command: string): string[] {
 	return ["", ...extensions];
 }
 
-async function findExecutableCandidate(basePath: string): Promise<string | null> {
+async function findExecutableCandidate(
+	basePath: string,
+): Promise<string | null> {
 	for (const extension of windowsExecutableExtensions(basePath)) {
 		const candidate = `${basePath}${extension}`;
 		if (await pathExists(candidate)) {
@@ -145,7 +188,10 @@ async function findExecutableCandidate(basePath: string): Promise<string | null>
 }
 
 async function findCommandPath(command: string): Promise<string | null> {
-	const isPathLike = command.includes(path.sep) || command.includes("/") || command.includes("\\");
+	const isPathLike =
+		command.includes(path.sep) ||
+		command.includes("/") ||
+		command.includes("\\");
 	if (isPathLike) {
 		return findExecutableCandidate(command);
 	}
@@ -165,7 +211,9 @@ async function findCommandPath(command: string): Promise<string | null> {
 async function findProjectRoot(startDir: string): Promise<string> {
 	let current = path.resolve(startDir);
 	while (true) {
-		if (await pathExists(path.join(current, ".cocoindex_code", "settings.yml"))) {
+		if (
+			await pathExists(path.join(current, ".cocoindex_code", "settings.yml"))
+		) {
 			return current;
 		}
 		if (await pathExists(path.join(current, ".git"))) {
@@ -188,7 +236,10 @@ function renderStatus(ctx: ExtensionContext, state: StatusState): void {
 
 	if (state.busy) {
 		const dot = theme.fg("accent", "●");
-		ctx.ui.setStatus(STATUS_KEY, `${dot}${theme.fg("dim", ` ccc ${state.busy}...`)}`);
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			`${dot}${theme.fg("dim", ` ccc ${state.busy}...`)}`,
+		);
 		return;
 	}
 
@@ -199,10 +250,18 @@ function renderStatus(ctx: ExtensionContext, state: StatusState): void {
 
 	const check = theme.fg("success", "✓");
 	const rootName = path.basename(state.projectRoot) || state.projectRoot;
-	ctx.ui.setStatus(STATUS_KEY, `${check}${theme.fg("dim", ` ccc ${rootName} · ${state.lastSummary}`)}`);
+	ctx.ui.setStatus(
+		STATUS_KEY,
+		`${check}${theme.fg("dim", ` ccc ${rootName} · ${state.lastSummary}`)}`,
+	);
 }
 
-function runCommand(command: string, args: string[], cwd: string, signal?: AbortSignal): Promise<CommandResult> {
+function runCommand(
+	command: string,
+	args: string[],
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<CommandResult> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
 			cwd,
@@ -244,11 +303,18 @@ function runCommand(command: string, args: string[], cwd: string, signal?: Abort
 	});
 }
 
-async function validateCccPython(pythonPath: string, projectRoot: string): Promise<string | null> {
+async function validateCccPython(
+	pythonPath: string,
+	projectRoot: string,
+): Promise<string | null> {
 	if (!(await pathExists(pythonPath))) {
 		return null;
 	}
-	const check = await runCommand(pythonPath, ["-c", "import cocoindex_code, sys; print(sys.executable)"], projectRoot);
+	const check = await runCommand(
+		pythonPath,
+		["-c", "import cocoindex_code, sys; print(sys.executable)"],
+		projectRoot,
+	);
 	return check.code === 0 ? pythonPath : null;
 }
 
@@ -269,11 +335,17 @@ async function getUvToolDir(projectRoot: string): Promise<string | null> {
 	if (result.code !== 0) {
 		return null;
 	}
-	const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	const lines = result.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
 	return lines[lines.length - 1] ?? null;
 }
 
-async function cccPythonCandidates(projectRoot: string, cccPath: string): Promise<string[]> {
+async function cccPythonCandidates(
+	projectRoot: string,
+	cccPath: string,
+): Promise<string[]> {
 	const candidates: string[] = [];
 	const addToolDir = (toolDir: string | null | undefined) => {
 		if (!toolDir) return;
@@ -290,15 +362,40 @@ async function cccPythonCandidates(projectRoot: string, cccPath: string): Promis
 	if (home) {
 		addToolDir(path.join(home, ".local", "share", "uv", "tools"));
 		candidates.push(
-			path.join(home, ".local", "pipx", "venvs", "cocoindex-code", "Scripts", "python.exe"),
-			path.join(home, ".local", "pipx", "venvs", "cocoindex-code", "bin", "python"),
+			path.join(
+				home,
+				".local",
+				"pipx",
+				"venvs",
+				"cocoindex-code",
+				"Scripts",
+				"python.exe",
+			),
+			path.join(
+				home,
+				".local",
+				"pipx",
+				"venvs",
+				"cocoindex-code",
+				"bin",
+				"python",
+			),
 		);
 	}
 
 	for (const envRoot of [process.env.APPDATA, process.env.LOCALAPPDATA]) {
 		if (!envRoot) continue;
 		addToolDir(path.join(envRoot, "uv", "tools"));
-		candidates.push(path.join(envRoot, "pipx", "venvs", "cocoindex-code", "Scripts", "python.exe"));
+		candidates.push(
+			path.join(
+				envRoot,
+				"pipx",
+				"venvs",
+				"cocoindex-code",
+				"Scripts",
+				"python.exe",
+			),
+		);
 	}
 
 	return [...new Set(candidates)];
@@ -315,9 +412,12 @@ async function resolveCccPython(projectRoot: string): Promise<string> {
 		const launcherText = await readFile(cccPath, "utf8");
 		const pythonHint = parseShebangInterpreter(launcherText);
 		if (pythonHint) {
-			const pythonPath = pythonHint.includes(path.sep) || pythonHint.includes("/") || pythonHint.includes("\\")
-				? pythonHint
-				: await findCommandPath(pythonHint);
+			const pythonPath =
+				pythonHint.includes(path.sep) ||
+				pythonHint.includes("/") ||
+				pythonHint.includes("\\")
+					? pythonHint
+					: await findCommandPath(pythonHint);
 			if (pythonPath) {
 				const valid = await validateCccPython(pythonPath, projectRoot);
 				if (valid) return valid;
@@ -336,16 +436,29 @@ async function resolveCccPython(projectRoot: string): Promise<string> {
 	);
 }
 
-async function detectRapidFuzzVersion(pythonPath: string, projectRoot: string): Promise<string | null> {
-	const check = await runCommand(pythonPath, ["-c", "import rapidfuzz; print(rapidfuzz.__version__)"], projectRoot);
+async function detectRapidFuzzVersion(
+	pythonPath: string,
+	projectRoot: string,
+): Promise<string | null> {
+	const check = await runCommand(
+		pythonPath,
+		["-c", "import rapidfuzz; print(rapidfuzz.__version__)"],
+		projectRoot,
+	);
 	if (check.code !== 0) {
 		return null;
 	}
-	const lines = check.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	const lines = check.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
 	return lines[lines.length - 1] ?? "installed";
 }
 
-async function ensureRapidFuzz(pythonPath: string, projectRoot: string): Promise<string> {
+async function ensureRapidFuzz(
+	pythonPath: string,
+	projectRoot: string,
+): Promise<string> {
 	const existing = await detectRapidFuzzVersion(pythonPath, projectRoot);
 	if (existing) {
 		return `RapidFuzz ${existing} is available for fuzzy reranking.`;
@@ -356,7 +469,11 @@ async function ensureRapidFuzz(pythonPath: string, projectRoot: string): Promise
 		return "RapidFuzz is not installed; falling back to the built-in fuzzy reranker.";
 	}
 
-	const install = await runCommand(uvPath, ["pip", "install", "--python", pythonPath, "rapidfuzz"], projectRoot);
+	const install = await runCommand(
+		uvPath,
+		["pip", "install", "--python", pythonPath, "rapidfuzz"],
+		projectRoot,
+	);
 	if (install.code !== 0) {
 		return `RapidFuzz install failed; using the built-in fuzzy reranker instead. ${install.combined || ""}`.trim();
 	}
@@ -366,6 +483,155 @@ async function ensureRapidFuzz(pythonPath: string, projectRoot: string): Promise
 		return `Installed RapidFuzz ${installed} for BM25 reranking.`;
 	}
 	return "RapidFuzz install completed, but the module is still unavailable; using the built-in fuzzy reranker.";
+}
+
+async function detectCocoindexVersion(
+	pythonPath: string,
+	projectRoot: string,
+): Promise<string | null> {
+	const check = await runCommand(
+		pythonPath,
+		["-c", "from cocoindex_code._version import __version__; print(__version__)"],
+		projectRoot,
+	);
+	if (check.code !== 0) {
+		return null;
+	}
+	const lines = check.stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	return lines[lines.length - 1] ?? null;
+}
+
+async function reinstallPinnedCocoindex(
+	projectRoot: string,
+): Promise<CommandResult> {
+	const uvPath = await findCommandPath("uv");
+	if (!uvPath) {
+		return {
+			code: 1,
+			stdout: "",
+			stderr: "uv not found on PATH",
+			combined: "uv not found on PATH",
+		};
+	}
+
+	const spec = `cocoindex-code==${PINNED_CCO_VERSION}`;
+	const upgrade = await runCommand(
+		uvPath,
+		["tool", "upgrade", "--reinstall", spec],
+		projectRoot,
+	);
+	if (upgrade.code === 0) {
+		return upgrade;
+	}
+
+	const install = await runCommand(
+		uvPath,
+		["tool", "install", "--force", "--reinstall", spec],
+		projectRoot,
+	);
+	if (install.code === 0) {
+		return install;
+	}
+
+	return {
+		code: install.code,
+		stdout: [upgrade.stdout, install.stdout].filter(Boolean).join("\n"),
+		stderr: [upgrade.stderr, install.stderr].filter(Boolean).join("\n"),
+		combined: [upgrade.combined, install.combined].filter(Boolean).join("\n"),
+	};
+}
+
+async function ensurePinnedCocoindexVersion(
+	projectRoot: string,
+	options: { forceInstall?: boolean } = {},
+): Promise<PinResult> {
+	if (!(await findCommandPath("ccc"))) {
+		return {
+			status: "missing",
+			message: "ccc not found on PATH",
+			installedVersion: null,
+		};
+	}
+
+	let pythonPath: string;
+	try {
+		pythonPath = await resolveCccPython(projectRoot);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			status: "failed",
+			message: `Could not resolve the ccc Python environment: ${message}`,
+			installedVersion: null,
+		};
+	}
+
+	const installedVersion = await detectCocoindexVersion(
+		pythonPath,
+		projectRoot,
+	);
+	if (installedVersion === PINNED_CCO_VERSION) {
+		return {
+			status: "pinned",
+			message: `cocoindex-code ${installedVersion} is pinned and ready.`,
+			installedVersion,
+		};
+	}
+
+	if (!options.forceInstall) {
+		return {
+			status: "mismatch",
+			message:
+				`Detected cocoindex-code ${installedVersion ?? "unknown"}; ` +
+				`BM25 mode is pinned to ${PINNED_CCO_VERSION}. Run /ccc-patch to reinstall the pinned version.`,
+			installedVersion,
+		};
+	}
+
+	const reinstall = await reinstallPinnedCocoindex(projectRoot);
+	if (reinstall.code !== 0) {
+		return {
+			status: "failed",
+			message:
+				`Failed to reinstall cocoindex-code ${PINNED_CCO_VERSION} with uv. ` +
+				(reinstall.combined || "Unknown error"),
+			installedVersion,
+		};
+	}
+
+	try {
+		pythonPath = await resolveCccPython(projectRoot);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			status: "failed",
+			message: `Reinstalled cocoindex-code, but could not resolve its Python environment: ${message}`,
+			installedVersion,
+		};
+	}
+
+	const reinstalledVersion = await detectCocoindexVersion(
+		pythonPath,
+		projectRoot,
+	);
+	if (reinstalledVersion !== PINNED_CCO_VERSION) {
+		return {
+			status: "failed",
+			message:
+				`uv reinstall completed, but cocoindex-code resolved to ${reinstalledVersion ?? "unknown"} ` +
+				`instead of ${PINNED_CCO_VERSION}.`,
+			installedVersion: reinstalledVersion,
+		};
+	}
+
+	return {
+		status: "pinned",
+		message:
+			`Reinstalled cocoindex-code ${reinstalledVersion} with uv and re-pinned the BM25-compatible version.`,
+		installedVersion: reinstalledVersion,
+	};
 }
 
 function parsePatchPayload(output: string): PatchScriptPayload | null {
@@ -381,7 +647,10 @@ function parsePatchPayload(output: string): PatchScriptPayload | null {
 	return null;
 }
 
-function normalizePatchResult(payload: PatchScriptPayload | null, fallbackMessage: string): PatchResult {
+function normalizePatchResult(
+	payload: PatchScriptPayload | null,
+	fallbackMessage: string,
+): PatchResult {
 	return {
 		status: payload?.status ?? "failed",
 		message: payload?.message ?? fallbackMessage,
@@ -390,7 +659,10 @@ function normalizePatchResult(payload: PatchScriptPayload | null, fallbackMessag
 	};
 }
 
-async function applyBm25Patch(projectRoot: string): Promise<PatchResult> {
+async function applyBm25Patch(
+	projectRoot: string,
+	options: { forceInstall?: boolean } = {},
+): Promise<PatchResult> {
 	const cccPath = await findCommandPath("ccc");
 	if (!cccPath) {
 		return {
@@ -410,20 +682,63 @@ async function applyBm25Patch(projectRoot: string): Promise<PatchResult> {
 	}
 
 	try {
+		const pinResult = await ensurePinnedCocoindexVersion(projectRoot, {
+			forceInstall: options.forceInstall,
+		});
+		if (pinResult.status === "missing") {
+			return {
+				status: "missing",
+				message: pinResult.message,
+				changedPaths: [],
+				scannedPaths: {},
+			};
+		}
+		if (pinResult.status === "mismatch") {
+			return {
+				status: "skipped",
+				message: pinResult.message,
+				changedPaths: [],
+				scannedPaths: {},
+			};
+		}
+		if (pinResult.status === "failed") {
+			return {
+				status: "failed",
+				message: pinResult.message,
+				changedPaths: [],
+				scannedPaths: {},
+			};
+		}
+
 		const pythonPath = await resolveCccPython(projectRoot);
 		const rapidFuzzMessage = await ensureRapidFuzz(pythonPath, projectRoot);
-		const patchCommand = await runCommand(pythonPath, [PATCH_SCRIPT_PATH], projectRoot);
+		const patchCommand = await runCommand(
+			pythonPath,
+			[PATCH_SCRIPT_PATH],
+			projectRoot,
+		);
 		const payload = parsePatchPayload(patchCommand.stdout);
-		const result = normalizePatchResult(payload, patchCommand.combined || "BM25 patch failed");
+		const result = normalizePatchResult(
+			payload,
+			patchCommand.combined || "BM25 patch failed",
+		);
 		if (patchCommand.code !== 0 && result.status !== "patched") {
-			return { ...result, status: "failed", message: `${result.message} ${rapidFuzzMessage}`.trim() };
+			return {
+				...result,
+				status: "failed",
+				message: `${result.message} ${rapidFuzzMessage}`.trim(),
+			};
 		}
 		const resultWithRapidFuzz = {
 			...result,
-			message: `${result.message} ${rapidFuzzMessage}`.trim(),
+			message: `${pinResult.message} ${result.message} ${rapidFuzzMessage}`.trim(),
 		};
 		if (result.status === "patched") {
-			const restart = await runCommand("ccc", ["daemon", "restart"], projectRoot);
+			const restart = await runCommand(
+				"ccc",
+				["daemon", "restart"],
+				projectRoot,
+			);
 			if (restart.code !== 0) {
 				return {
 					...resultWithRapidFuzz,
@@ -443,7 +758,10 @@ async function applyBm25Patch(projectRoot: string): Promise<PatchResult> {
 	}
 }
 
-async function ensureCompatibilityPatch(projectRoot: string, options: { force?: boolean } = {}): Promise<PatchResult> {
+async function ensureCompatibilityPatch(
+	projectRoot: string,
+	options: { force?: boolean; forceInstall?: boolean } = {},
+): Promise<PatchResult> {
 	if (patchPromise) {
 		return patchPromise;
 	}
@@ -451,7 +769,9 @@ async function ensureCompatibilityPatch(projectRoot: string, options: { force?: 
 		return patchResult;
 	}
 
-	patchPromise = applyBm25Patch(projectRoot)
+	patchPromise = applyBm25Patch(projectRoot, {
+		forceInstall: options.forceInstall,
+	})
 		.then((result) => {
 			patchResult = result;
 			return result;
@@ -463,16 +783,26 @@ async function ensureCompatibilityPatch(projectRoot: string, options: { force?: 
 	return patchPromise;
 }
 
-function appendPatchContext(message: string, compatResult: PatchResult | null): string {
+function appendPatchContext(
+	message: string,
+	compatResult: PatchResult | null,
+): string {
 	if (!compatResult) return message;
-	if (compatResult.status === "patched" || compatResult.status === "already_patched") {
+	if (
+		compatResult.status === "patched" ||
+		compatResult.status === "already_patched"
+	) {
 		return message;
 	}
 	return `${message}\nBM25 patch status: ${compatResult.message}`;
 }
 
 function parseSearchResults(stdout: string): SearchResult[] {
-	const matches = [...stdout.matchAll(/--- Result \d+ \(score: ([0-9.]+)\) ---\nFile: (.+?):(\d+)-(\d+) \[([^\]]+)\]\n([\s\S]*?)(?=\n--- Result \d+ \(score:|$)/g)];
+	const matches = [
+		...stdout.matchAll(
+			/--- Result \d+ \(score: ([0-9.]+)\) ---\nFile: (.+?):(\d+)-(\d+) \[([^\]]+)\]\n([\s\S]*?)(?=\n--- Result \d+ \(score:|$)/g,
+		),
+	];
 	return matches.map((match) => ({
 		score: Number(match[1]),
 		file_path: match[2],
@@ -483,7 +813,11 @@ function parseSearchResults(stdout: string): SearchResult[] {
 	}));
 }
 
-async function ensureSearchReady(projectRoot: string, signal: AbortSignal | undefined, onUpdate: (message: string) => void): Promise<void> {
+async function ensureSearchReady(
+	projectRoot: string,
+	signal: AbortSignal | undefined,
+	onUpdate: (message: string) => void,
+): Promise<void> {
 	onUpdate("Initializing cocoindex project...");
 	const initResult = await runCommand("ccc", ["init"], projectRoot, signal);
 	if (initResult.code !== 0) {
@@ -497,9 +831,16 @@ async function ensureSearchReady(projectRoot: string, signal: AbortSignal | unde
 	}
 }
 
-async function refreshState(ctx: ExtensionContext, state: StatusState): Promise<void> {
+async function refreshState(
+	ctx: ExtensionContext,
+	state: StatusState,
+): Promise<void> {
 	state.projectRoot = await findProjectRoot(process.cwd());
-	const settingsPath = path.join(state.projectRoot, ".cocoindex_code", "settings.yml");
+	const settingsPath = path.join(
+		state.projectRoot,
+		".cocoindex_code",
+		"settings.yml",
+	);
 	try {
 		state.available = true;
 		state.initialized = await pathExists(settingsPath);
@@ -515,13 +856,22 @@ async function refreshState(ctx: ExtensionContext, state: StatusState): Promise<
 export default function cocoindexExtension(pi: ExtensionAPI) {
 	const state = createDefaultState();
 
-	const notifyPatchResult = (ctx: ExtensionContext, result: PatchResult, manual = false) => {
+	const notifyPatchResult = (
+		ctx: ExtensionContext,
+		result: PatchResult,
+		manual = false,
+	) => {
 		if (result.status === "patched") {
 			ctx.ui.notify(`ccc bm25: ${result.message}`, "info");
 			return;
 		}
 		if (manual) {
-			const level = result.status === "failed" || result.status === "missing" || result.status === "skipped" ? "warning" : "info";
+			const level =
+				result.status === "failed" ||
+				result.status === "missing" ||
+				result.status === "skipped"
+					? "warning"
+					: "info";
 			ctx.ui.notify(`ccc bm25: ${result.message}`, level);
 			return;
 		}
@@ -530,12 +880,18 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	const runPatchPreflight = async (ctx: ExtensionContext, options: { force?: boolean; manual?: boolean } = {}) => {
+	const runPatchPreflight = async (
+		ctx: ExtensionContext,
+		options: { force?: boolean; forceInstall?: boolean; manual?: boolean } = {},
+	) => {
 		state.projectRoot = await findProjectRoot(process.cwd());
 		const previousBusy = state.busy;
 		state.busy = "patching";
 		renderStatus(ctx, state);
-		const result = await ensureCompatibilityPatch(state.projectRoot, { force: options.force });
+		const result = await ensureCompatibilityPatch(state.projectRoot, {
+			force: options.force,
+			forceInstall: options.forceInstall,
+		});
 		if (state.busy === "patching") {
 			state.busy = previousBusy === "patching" ? false : previousBusy;
 		}
@@ -589,15 +945,30 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 			state.busy = false;
 			renderStatus(ctx, state);
 			const compatResult = await runPatchPreflight(ctx);
-			const level = compatResult.status === "failed" || compatResult.status === "missing" || compatResult.status === "skipped" || !state.available ? "warning" : "info";
-			ctx.ui.notify(`ccc: ${state.lastSummary} | bm25 patch: ${compatResult.status}`, level);
+			const level =
+				compatResult.status === "failed" ||
+				compatResult.status === "missing" ||
+				compatResult.status === "skipped" ||
+				!state.available
+					? "warning"
+					: "info";
+			ctx.ui.notify(
+				`ccc: ${state.lastSummary} | bm25 patch: ${compatResult.status}`,
+				level,
+			);
 		},
 	});
 
 	pi.registerCommand("ccc-patch", {
-		description: "Patch cocoindex-code into BM25 mode and restart the ccc daemon",
+		description:
+			`Reinstall cocoindex-code ${PINNED_CCO_VERSION}, patch it into BM25 mode, and restart the ccc daemon`,
 		handler: async (_args, ctx) => {
-			await runPatchPreflight(ctx, { force: true, manual: true });
+			patchResult = null;
+			await runPatchPreflight(ctx, {
+				force: true,
+				forceInstall: true,
+				manual: true,
+			});
 			await refreshState(ctx, state);
 		},
 	});
@@ -605,8 +976,10 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "search",
 		label: "CocoIndex Search",
-		description: "Code search across the current codebase using cocoindex-code.",
-		promptSnippet: "Use this to search the codebase through cocoindex-code's BM25-aware search backend.",
+		description:
+			"Code search across the current codebase using cocoindex-code.",
+		promptSnippet:
+			"Use this to search the codebase through cocoindex-code's BM25-aware search backend.",
 		promptGuidelines: [
 			"Use for code search, implementation lookup, and retrieval after the extension patches cocoindex-code into BM25 mode.",
 			"Start with a small limit, then paginate with offset if the first results are relevant.",
@@ -615,9 +988,15 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			const params = rawParams as SearchParams;
 			state.projectRoot = await findProjectRoot(process.cwd());
-			let compatResult: PatchResult | null = await ensureCompatibilityPatch(state.projectRoot);
+			let compatResult: PatchResult | null = await ensureCompatibilityPatch(
+				state.projectRoot,
+			);
 			if (compatResult.status === "patched") {
-				onUpdate?.({ content: [{ type: "text", text: "Enabled BM25 mode for cocoindex-code." }] });
+				onUpdate?.({
+					content: [
+						{ type: "text", text: "Enabled BM25 mode for cocoindex-code." },
+					],
+				});
 			}
 			state.available = compatResult.status !== "missing";
 			state.busy = params.refresh_index === false ? "searching" : "indexing";
@@ -625,25 +1004,48 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 
 			const args = ["search"];
 			if (params.refresh_index !== false) args.push("--refresh");
-			for (const language of params.languages ?? []) args.push("--lang", language);
-			for (const searchPath of params.paths ?? []) args.push("--path", searchPath);
-			if (params.offset !== undefined) args.push("--offset", String(params.offset));
-			if (params.limit !== undefined) args.push("--limit", String(params.limit));
+			for (const language of params.languages ?? [])
+				args.push("--lang", language);
+			for (const searchPath of params.paths ?? [])
+				args.push("--path", searchPath);
+			if (params.offset !== undefined)
+				args.push("--offset", String(params.offset));
+			if (params.limit !== undefined)
+				args.push("--limit", String(params.limit));
 			args.push(params.query);
 
 			let commandResult: CommandResult;
 			try {
-				onUpdate?.({ content: [{ type: "text", text: `Running \`ccc ${args.join(" ")}\`` }] });
-				commandResult = await runCommand("ccc", args, state.projectRoot, signal);
+				onUpdate?.({
+					content: [
+						{ type: "text", text: `Running \`ccc ${args.join(" ")}\`` },
+					],
+				});
+				commandResult = await runCommand(
+					"ccc",
+					args,
+					state.projectRoot,
+					signal,
+				);
 				if (commandResult.code !== 0 && isInitError(commandResult.combined)) {
 					await ensureSearchReady(state.projectRoot, signal, (message) => {
 						onUpdate?.({ content: [{ type: "text", text: message }] });
 					});
-					commandResult = await runCommand("ccc", args, state.projectRoot, signal);
+					commandResult = await runCommand(
+						"ccc",
+						args,
+						state.projectRoot,
+						signal,
+					);
 				}
 
 				if (commandResult.code !== 0) {
-					throw new Error(appendPatchContext(commandResult.combined || "ccc search failed", compatResult));
+					throw new Error(
+						appendPatchContext(
+							commandResult.combined || "ccc search failed",
+							compatResult,
+						),
+					);
 				}
 
 				const results = parseSearchResults(commandResult.stdout);
@@ -653,7 +1055,15 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 				renderStatus(ctx, state);
 
 				return {
-					content: [{ type: "text", text: results.length > 0 ? `Found ${results.length} cocoindex result(s).` : "No results found." }],
+					content: [
+						{
+							type: "text",
+							text:
+								results.length > 0
+									? `Found ${results.length} cocoindex result(s).`
+									: "No results found.",
+						},
+					],
 					details: {
 						success: true,
 						results,
@@ -663,7 +1073,10 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 					},
 				};
 			} catch (error) {
-				const message = appendPatchContext(error instanceof Error ? error.message : String(error), compatResult);
+				const message = appendPatchContext(
+					error instanceof Error ? error.message : String(error),
+					compatResult,
+				);
 				state.busy = false;
 				state.lastSummary = message;
 				if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
@@ -674,7 +1087,9 @@ export default function cocoindexExtension(pi: ExtensionAPI) {
 				renderStatus(ctx, state);
 
 				return {
-					content: [{ type: "text", text: `CocoIndex search failed: ${message}` }],
+					content: [
+						{ type: "text", text: `CocoIndex search failed: ${message}` },
+					],
 					details: {
 						success: false,
 						results: [],
