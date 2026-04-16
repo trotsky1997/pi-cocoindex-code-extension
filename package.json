@@ -1,20 +1,33 @@
 {
-  "name": "pi-cocoindex-code-extension",
-  "version": "0.1.0",
-  "type": "module",
-  "description": "Pi package bundling a CocoIndex search extension and the ccc skill.",
-  "license": "MIT",
-  "keywords": ["pi-package", "pi", "cocoindex", "ccc", "semantic-search"],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/trotsky1997/pi-cocoindex-code-extension.git"
-  },
-  "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
-  },
-  "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
-  }
+	"name": "pi-cocoindex-code-extension",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Pi package bundling a CocoIndex search extension and the ccc skill.",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"cocoindex",
+		"ccc",
+		"semantic-search"
+	],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/trotsky1997/pi-cocoindex-code-extension.git"
+	},
+	"scripts": {
+		"test:patch": "python -m unittest tests/test_cocoindex_bm25_patch.py"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
+		"@sinclair/typebox": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions"
+		],
+		"skills": [
+			"./skills"
+		]
+	}
 }

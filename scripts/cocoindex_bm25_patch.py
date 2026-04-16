@@ -67,7 +67,6 @@ class BM25Embedder(_schema.VectorSchemaProvider):
             self._batch_cache[count] = cached
         return list(cached)
 
-    @coco.fn.as_async(memo=True)
     async def __coco_vector_schema__(self) -> _schema.VectorSchema:
         return _schema.VectorSchema(dtype=np.dtype(np.float32), size=1)
 
@@ -187,6 +186,12 @@ class CodeChunk:
     end_line: int
     embedding: Annotated[npt.NDArray[np.float32], EMBEDDER]
 '''
+
+RESOURCE_SCHEMA_TYPE_CHECKING_IMPORT = """if _typing.TYPE_CHECKING:
+    import numpy as _np
+"""
+
+RESOURCE_SCHEMA_RUNTIME_IMPORT = "import numpy as _np\n"
 
 DESIRED_QUERY = '''"""Query implementation for codebase search."""
 
@@ -567,6 +572,22 @@ def patch_shared(source: str) -> str:
     return DESIRED_SHARED
 
 
+def patch_resource_schema(source: str) -> str:
+    if (
+        RESOURCE_SCHEMA_RUNTIME_IMPORT in source
+        and RESOURCE_SCHEMA_TYPE_CHECKING_IMPORT not in source
+    ):
+        return source
+    if (
+        RESOURCE_SCHEMA_TYPE_CHECKING_IMPORT not in source
+        or "dtype: _np.dtype" not in source
+    ):
+        raise RuntimeError("cocoindex.resources.schema.py layout is not recognized.")
+    return source.replace(
+        RESOURCE_SCHEMA_TYPE_CHECKING_IMPORT, RESOURCE_SCHEMA_RUNTIME_IMPORT, 1
+    )
+
+
 def patch_query(source: str) -> str:
     if (
         PATCH_MARKER in source
@@ -651,6 +672,10 @@ def ensure_global_settings_switched() -> bool:
 
 def main() -> None:
     targets = {
+        "resource_schema": (
+            patch_resource_schema,
+            *load_source("cocoindex.resources.schema"),
+        ),
         "shared": (patch_shared, *load_source("cocoindex_code.shared")),
         "indexer": (patch_indexer, *load_source("cocoindex_code.indexer")),
         "project": (patch_project, *load_source("cocoindex_code.project")),
